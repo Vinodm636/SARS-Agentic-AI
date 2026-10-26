@@ -1,0 +1,60 @@
+# ============================================================
+#  Render.com Blueprint — one-click deploy for SARS
+# ============================================================
+#  1. Push this file to your GitHub repo
+#  2. Go to https://dashboard.render.com/blueprints
+#  3. Click "New Blueprint" → select this repo
+#  4. Fill in the environment variables (API keys)
+#  5. Click "Apply" — both services deploy in ~3 minutes
+# ============================================================
+
+services:
+
+  # ── Backend: FastAPI Python API ──────────────────────────────
+  - type: web
+    name: sars-backend
+    env: python
+    region: oregon          # closest to most users; change if needed
+    plan: free               # free tier: 512 MB RAM, spins down after 15 min idle
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    envVars:
+      # ── SMS Provider (textbee for free real SMS) ──────────────
+      - key: SMS_PROVIDER
+        value: textbee
+      - key: TEXTBEE_API_KEY
+        sync: false          # set manually in dashboard — secret
+      - key: TEXTBEE_DEVICE_ID
+        sync: false          # set manually in dashboard — secret
+      # ── Groq API (speech-to-text) ────────────────────────────
+      - key: GROQ_API_KEY
+        sync: false          # set manually in dashboard — secret
+      # ── Tracking link (points to the frontend service below) ─
+      - key: TRACKING_BASE_URL
+        value: https://sars-frontend.onrender.com
+      # ── CORS (allow the frontend to talk to this backend) ─────
+      - key: CORS_ORIGINS
+        value: https://sars-frontend.onrender.com
+
+  # ── Frontend: React static site ──────────────────────────────
+  - type: web
+    name: sars-frontend
+    env: static
+    region: oregon
+    plan: free               # free tier: 100 GB bandwidth/month
+    buildCommand: npm install && npm run build
+    staticPublishDir: ./build
+    # SPA routing: send all routes to index.html
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+    envVars:
+      # ── Frontend talks to the backend API ─────────────────────
+      - key: REACT_APP_API_URL
+        value: https://sars-backend.onrender.com/api
+      # ── TomTom Maps API key (used in ActiveEmergencies.js) ────
+      - key: REACT_APP_TOMTOM_API_KEY
+        sync: false          # set manually — your TomTom key
