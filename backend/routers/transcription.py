@@ -10,6 +10,16 @@ except ImportError:  # pragma: no cover - supports running the backend directly
 router = APIRouter()
 transcription_service = TranscriptionService()
 
+
+@router.get("/health")
+async def transcription_health() -> Dict[str, Any]:
+    """
+    Check if the transcription service is properly configured.
+    Does NOT make any API calls — just validates the Groq key exists.
+    """
+    return transcription_service.check_health()
+
+
 @router.post("/upload")
 async def transcribe_audio(
     audio: UploadFile = File(..., description="Emergency call audio file (MP3, WAV, etc.)")
@@ -49,9 +59,20 @@ async def transcribe_audio(
         result = await transcription_service.process_audio_file(file_bytes, audio.filename)
         
         if not result.get("success"):
+            # Use error_type to set appropriate HTTP status
+            error_type = result.get("error_type", "")
+            if error_type in ("not_configured", "auth_error"):
+                status = 503  # Service unavailable — configuration issue
+            elif error_type == "rate_limit":
+                status = 429
+            elif error_type == "format_error":
+                status = 400
+            else:
+                status = 500
+            
             raise HTTPException(
-                status_code=500,
-                detail=f"Transcription failed: {result.get('error', 'Unknown error')}"
+                status_code=status,
+                detail=result.get("error", "Transcription failed")
             )
         
         return JSONResponse(

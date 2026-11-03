@@ -2,56 +2,130 @@ import os
 import re
 import tempfile
 import json
+import logging
 from typing import Dict, Any
-from groq import Groq
 from pathlib import Path
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
+_PLACEHOLDER_KEYS = {"", "your_groq_api_key_here", "your_groq_key_here", "gsk_test", "none"}
+
 
 class TranscriptionService:
     """
     Service for transcribing emergency call audio files and extracting patient information
-    using Groq's Whisper for transcription and Llama for information extraction
+    using Groq's Whisper for transcription and Llama for information extraction.
+
+    Configuration (environment variables):
+      GROQ_API_KEY         — Required. Get a FREE key at https://console.groq.com/keys
+      GROQ_WHISPER_MODEL   — Optional. Default: whisper-large-v3
+      GROQ_LLM_MODEL       — Optional. Default: llama-3.3-70b-versatile
     """
 
     def __init__(self):
-        # Set Groq API key from environment variable
-        self.api_key = os.getenv("GROQ_API_KEY")
-        self.client = Groq(api_key=self.api_key)
+        self.api_key = os.getenv("GROQ_API_KEY", "").strip()
+        self.whisper_model = os.getenv("GROQ_WHISPER_MODEL", "whisper-large-v3").strip()
+        self.llm_model = os.getenv("GROQ_LLM_MODEL", "llama-3.3-70b-versatile").strip()
+
+        # Validate key — check for empty or placeholder values
+        if not self.api_key or self.api_key.lower() in _PLACEHOLDER_KEYS:
+            self.is_configured = False
+            self.client = None
+            logger.warning(
+                "[Transcription] GROQ_API_KEY is not set or is a placeholder. "
+                "Get a free key at https://console.groq.com/keys"
+            )
+        else:
+            try:
+                from groq import Groq
+                self.client = Groq(api_key=self.api_key)
+                self.is_configured = True
+                logger.info(
+                    "[Transcription] Groq client initialised "
+                    "(Whisper: %s, LLM: %s).",
+                    self.whisper_model, self.llm_model,
+                )
+            except ImportError:
+                self.is_configured = False
+                self.client = None
+                logger.error(
+                    "[Transcription] groq package not installed. "
+                    "Run: pip install groq"
+                )
+            except Exception as exc:
+                self.is_configured = False
+                self.client = None
+                logger.error("[Transcription] Groq init error: %s", exc)
+
+    def check_health(self) -> dict:
+        """
+        Return the health status of the transcription service without
+        making any API calls.  Used by the /health endpoint.
+        """
+        if not self.is_configured:
+            return {
+                "status": "error",
+                "configured": False,
+                "message": (
+                    "GROQ_API_KEY is missing or is a placeholder. "
+                    "Get a free key at https://console.groq.com/keys "
+                    "and set it in backend/.env"
+                ),
+            }
+        return {
+            "status": "ok",
+            "configured": True,
+            "whisper_model": self.whisper_model,
+            "llm_model": self.llm_model,
+        }
 
     async def transcribe_audio(self, audio_file_path: str) -> Dict[str, Any]:
         """
-        Transcribe audio file to text using OpenAI Whisper API
+        Transcribe audio file to text using Groq Whisper API.
 
-        Args:
-            audio_file_path: Path to the audio file (MP3, WAV, etc.)
-
-        Returns:
-            Dictionary containing transcription and extracted information
+        Handles these error cases with clear messages:
+          - Missing/expired API key
+          - Authentication failures (401)
+          - Rate limiting (429)
+          - Unsupported audio format
+          - Network errors
         """
+        # ── Pre-flight: check configuration ────────────────────────────────
+        if not self.is_configured or self.client is None:
+            return {
+                "success": False,
+                "error": (
+                    "Groq API key is not configured. Get a FREE key at "
+                    "https://console.groq.com/keys and set GROQ_API_KEY in "
+                    "backend/.env"
+                ),
+                "error_type": "not_configured",
+                "transcription": "",
+                "extracted_data": {},
+            }
+
         try:
-            # Read audio file
             with open(audio_file_path, "rb") as audio_file:
-                # Use Groq Whisper API for transcription
                 transcript_response = self.client.audio.transcriptions.create(
-                    model="whisper-large-v3",
+                    model=self.whisper_model,
                     file=audio_file,
-                    language="en",  # Can be made dynamic based on requirement
-                    response_format="json"
+                    language="en",
+                    response_format="json",
                 )
 
             transcribed_text = transcript_response.text if hasattr(
-                transcript_response, 'text') else ""
+                transcript_response, "text") else ""
 
             if not transcribed_text:
                 return {
                     "success": False,
-                    "error": "No transcription generated",
+                    "error": "No transcription generated — the audio may be silent or empty.",
                     "transcription": "",
-                    "extracted_data": {}
+                    "extracted_data": {},
                 }
 
             # Extract patient information from transcribed text
@@ -61,15 +135,48 @@ class TranscriptionService:
                 "success": True,
                 "transcription": transcribed_text,
                 "extracted_data": extracted_data,
-                "audio_duration": getattr(transcript_response, 'duration', 0)
+                "audio_duration": getattr(transcript_response, "duration", 0),
             }
 
         except Exception as e:
+            error_str = str(e)
+            error_type = "unknown"
+
+            # Classify the error for clear messaging
+            if "401" in error_str or "Invalid API Key" in error_str or "expired_api_key" in error_str:
+                error_type = "auth_error"
+                friendly = (
+                    "Groq API key is invalid or expired. Generate a new FREE key "
+                    "at https://console.groq.com/keys and update GROQ_API_KEY "
+                    "in backend/.env"
+                )
+            elif "429" in error_str or "rate_limit" in error_str.lower():
+                error_type = "rate_limit"
+                friendly = (
+                    "Groq API rate limit reached. Wait a moment and try again."
+                )
+            elif "Unsupported" in error_str or "format" in error_str.lower():
+                error_type = "format_error"
+                friendly = (
+                    f"Unsupported audio format. Use MP3, WAV, M4A, OGG, or FLAC. "
+                    f"Detail: {error_str}"
+                )
+            elif "Connection" in error_str or "timeout" in error_str.lower() or "Network" in error_str:
+                error_type = "network_error"
+                friendly = (
+                    "Network error reaching Groq API. Check your internet "
+                    "connection and try again."
+                )
+            else:
+                friendly = f"Transcription failed: {error_str}"
+
+            logger.error("[Transcription] %s: %s", error_type, error_str)
             return {
                 "success": False,
-                "error": str(e),
+                "error": friendly,
+                "error_type": error_type,
                 "transcription": "",
-                "extracted_data": {}
+                "extracted_data": {},
             }
 
     async def extract_patient_info(self, transcribed_text: str) -> Dict[str, Any]:
@@ -140,7 +247,7 @@ Return ONLY valid JSON. No markdown, no explanations, just the JSON object.
 
             # Call Groq API for information extraction using Llama
             response = self.client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
+                model=self.llm_model,
                 messages=[
                     {
                         "role": "system",
